@@ -55,7 +55,10 @@ class PPOTrainer:
                  clip_norm : float = 0.5,
                  norm_adv : bool = True,
                  ppo_epoch : int = 4,
-                 gamma : float = 1.0):
+                 ppo_num_minibatch : int = 4,
+                 gamma : float = 1.0,
+                 use_gae : bool = True,
+                 lam : float = 0.95):
         self.rollout_num = rollout_num
         self.rollout_length = rollout_length 
         self.env = env
@@ -64,13 +67,16 @@ class PPOTrainer:
         self.gamma = gamma
         self.num_env = self.env.num_envs
         self.epsilon = epsilon
-        self.ppo_batch_size = 4
+        self.ppo_num_minibatch = ppo_num_minibatch
+        self.ppo_batch_size = (self.num_env * self.rollout_length) // self.ppo_num_minibatch
         self.indice_dataset = TensorDataset(torch.arange(self.num_env*self.rollout_length))
         self.value_loss_weight = value_loss_weight
         self.agent_optimizer = torch.optim.Adam(self.agent.parameters(), lr=2e-4)
         self.clip_norm = clip_norm
         self.ppo_epoch = ppo_epoch
         self.norm_adv = norm_adv
+        self.use_gae = use_gae
+        self.lam = lam
     @torch.no_grad
     def validate(self):
         obs, _ = self.env.reset()
@@ -102,63 +108,72 @@ class PPOTrainer:
         writer = SummaryWriter()
         obs, _ = self.env.reset()
         obs = torch.tensor(obs, device=self.device)
-        for n_rollout in range(self.rollout_num):
+
+        with torch.no_grad():
             # n step estimation here
             # we ignore truncation here and treat it as termination
-            rollout_obs = []
-            rewards = []
-            action_log_probs = []
-            actions = []
-            state_values = []
-            
-            terminateds = []
-            truncateds = []
+            rollout_obs = torch.zeros((self.rollout_length, self.num_env) + self.env.single_observation_space.shape, device=self.device)
+            rewards = torch.zeros((self.rollout_length, self.num_env), device=self.device)
+            action_log_probs = torch.zeros((self.rollout_length, self.num_env), device=self.device)
+            actions = torch.zeros((self.rollout_length, self.num_env) + self.env.single_action_space.shape, device=self.device, dtype=torch.long)
+            state_values = torch.zeros((self.rollout_length, self.num_env), device=self.device)
+            terminateds = torch.zeros((self.rollout_length, self.num_env), device=self.device, dtype=torch.bool)
+            truncateds = torch.zeros((self.rollout_length, self.num_env), device=self.device, dtype=torch.bool)
+            G_ts = torch.zeros_like(state_values)
+            A_ts = torch.zeros_like(G_ts)
+
+        for n_rollout in range(self.rollout_num):
             with torch.no_grad():
                 self.agent.eval()
-                for _ in range(0, self.rollout_length):
-                    rollout_obs.append(obs)
+                for i in range(0, self.rollout_length):
+                    rollout_obs[i] = obs
                     action, action_log_prob, entropy, state_value = self.agent.get_action_and_value(obs, action=None)
-                    actions.append(action)
-                    action_log_probs.append(action_log_prob)                
-                    state_values.append(state_value)
+                    actions[i] = action
+                    action_log_probs[i] = action_log_prob             
+                    state_values[i] = state_value
                     next_obs, reward, terminated, truncated, _ = self.env.step(action.tolist())
-                    rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
-                    terminateds.append(torch.tensor(terminated, device=self.device))
-                    truncateds.append(torch.tensor(truncated, device=self.device))
+                    rewards[i] = torch.tensor(reward, device=self.device)
+                    terminateds[i] = torch.tensor(terminated, device=self.device)
+                    truncateds[i] = torch.tensor(truncated, device=self.device)
                     obs = next_obs
                     obs = torch.tensor(obs, device=self.device)
-            G_t = self.agent.get_action_and_value(obs, action=None)
-            G_ts = [-1 for _ in range(self.rollout_length)]
-            # rollout_obs[i] -> s_i
-            # rewards[i] -> r_i
-            # terminated[i] -> whether s_i -> s_i+1 results in termination
-            for i in range(self.rollout_length -1, -1, -1):
-                # if truncated or done, we set gamma to zero
-                truncated_gamma = torch.where(terminateds[i] | truncateds[i], 0, self.gamma)
-                G_t = G_t * truncated_gamma + rewards[i]
-                G_ts[i] = G_t
-            
-            rollout_obs = torch.cat(rollout_obs, dim=0)
-            actions = torch.cat(actions, dim=0)
-            action_log_probs = torch.cat(action_log_probs, dim = 0)
-            G_ts = torch.cat(G_ts, dim=0)
-            state_values = torch.cat(state_values, dim=0)
+
+                next_state_value = self.agent.get_action_and_value(obs, action=None)[-1]
+                
+                if self.use_gae:
+                    lastgaelam = 0
+                    for i in range(self.rollout_length -1, -1, -1):
+                        truncated_gamma = torch.where(terminateds[i] | truncateds[i], 0, self.gamma)
+                        delta_t = rewards[i] + truncated_gamma * next_state_value - state_values[i]
+                        A_ts[i] = lastgaelam = delta_t + truncated_gamma * self.lam * lastgaelam
+                        next_state_value = state_values[i]
+                    G_ts = A_ts + state_values
+                else:
+                    # rollout_obs[i] -> s_i
+                    # rewards[i] -> r_i
+                    # terminated[i] -> whether s_i -> s_i+1 results in termination
+                    G_t = next_state_value
+                    for i in range(self.rollout_length -1, -1, -1):
+                        # if truncated or done, we set gamma to zero
+                        truncated_gamma = torch.where(terminateds[i] | truncateds[i], 0, self.gamma)
+                        G_ts[i] = G_t = G_t * truncated_gamma + rewards[i]
+                    A_ts = G_ts - state_values
+                    
             # without TD(lambda)
             assert G_ts.shape == state_values.shape
-            A_ts = G_ts - state_values
-
             dataloader = DataLoader(self.indice_dataset, batch_size = self.ppo_batch_size, shuffle=True)
             self.agent.train()
             for i in range(self.ppo_epoch):
                 for indices in dataloader:
-                    rollout_obs_batch = rollout_obs[indices]
-                    actions_batch = actions[indices]
+                    rollout_obs_batch = rollout_obs.view((self.rollout_length*self.num_env,) + self.env.single_observation_space.shape)[indices]
+                    actions_batch = actions.view((self.rollout_length*self.num_env,) + self.env.single_action_space.shape)[indices]
+                    G_ts_batch = G_ts.view(-1)[indices]
+                    action_log_probs_batch = action_log_probs.view(-1)[indices]
+                    A_ts_batch = A_ts.view(-1)[indices]
                     _, new_action_log_prob_batch, _, new_state_value  = self.agent.get_action_and_value(rollout_obs_batch, action=actions_batch)
-                    A_ts_batch = A_ts[indices]
                     if self.norm_adv:
                         A_ts_batch = (A_ts_batch - A_ts_batch.mean()) / (A_ts_batch.std() + 1e-8)
-                    G_ts_batch = G_ts[indices]
-                    action_log_probs_batch = action_log_probs[indices]
+                    
                     ratio = torch.exp(new_action_log_prob_batch - action_log_probs_batch)
                     L_pi = torch.min(ratio * A_ts_batch, torch.clip(ratio, 1-self.epsilon, 1+self.epsilon) * A_ts_batch)
                     L_pi = L_pi.mean()
