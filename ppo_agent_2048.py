@@ -14,6 +14,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout = 0.1):
         super().__init__()
@@ -25,23 +26,27 @@ class MLP(nn.Module):
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.Dropout(dropout),
             nn.PReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.Dropout(dropout),
+            nn.PReLU(),
             layer_init(nn.Linear(hidden_dim, output_dim))
         )
         
     def forward(self, x):
         x = self.net(x)
         return x
-        
+
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, dropout):
         super().__init__()
-        self.critic = MLP(np.array(envs.single_observation_space.shape).prod(), 128, 1)
-        self.actor =  MLP(np.array(envs.single_observation_space.shape).prod(), 128, envs.single_action_space.n)
+        self.critic = MLP(np.array(envs.single_observation_space.shape).prod(), 128, 1, dropout)
+        self.actor =  MLP(np.array(envs.single_observation_space.shape).prod(), 128, envs.single_action_space.n, dropout)
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
+        x = x.float().flatten(start_dim=1)
         logits = self.actor(x)
         probs = torch.distributions.Categorical(logits=logits)
         if action is None:
@@ -77,7 +82,7 @@ class PPOTrainer:
         self.ppo_batch_size = (self.num_env * self.rollout_length) // self.ppo_num_minibatch
         self.indice_dataset = TensorDataset(torch.arange(self.num_env*self.rollout_length))
         self.value_loss_weight = value_loss_weight
-        self.agent_optimizer = torch.optim.Adam(self.agent.parameters(), lr=5e-4)
+        self.agent_optimizer = torch.optim.Adam(self.agent.parameters(), lr=2e-4)
         self.clip_norm = clip_norm
         self.ppo_epoch = ppo_epoch
         self.norm_adv = norm_adv
@@ -107,7 +112,8 @@ class PPOTrainer:
             G_t = torch.zeros(self.num_env, device=self.device)
             for i in range(sampling_length -1, -1, -1):
                 # if truncated or done, we set gamma to zero
-                truncated_gamma = torch.where(terminateds[i] | truncateds[i], 0, self.gamma)
+                # TODO : we set this to one
+                truncated_gamma = torch.where(terminateds[i] | truncateds[i], 0, 1)
                 G_t = G_t * truncated_gamma + rewards[i]
                 G_ts[i] = G_t
             return G_ts[0].mean()

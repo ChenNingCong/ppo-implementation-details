@@ -31,6 +31,9 @@ class MLP(nn.Module):
             layer_init(nn.Linear(hidden_dim, hidden_dim)),
             nn.Dropout(dropout),
             nn.PReLU(),
+            layer_init(nn.Linear(hidden_dim, hidden_dim)),
+            nn.Dropout(dropout),
+            nn.PReLU(),
             layer_init(nn.Linear(hidden_dim, output_dim))
         )
         
@@ -39,15 +42,16 @@ class MLP(nn.Module):
         return x
         
 class Agent(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, dropout):
         super().__init__()
-        self.critic = MLP(np.array(env.observation_space.shape).prod(), 128, 1)
-        self.actor =  MLP(np.array(env.observation_space.shape).prod(), 128, env.action_space.n)
+        self.critic = MLP(np.array(env.observation_space.shape).prod(), 128, 1, dropout)
+        self.actor =  MLP(np.array(env.observation_space.shape).prod(), 128, env.action_space.n, dropout)
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
+        x = x.float().flatten(start_dim=1)
         logits = self.actor(x)
         probs = torch.distributions.Categorical(logits=logits)
         if action is None:
